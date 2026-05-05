@@ -9,7 +9,6 @@ android {
 
     defaultConfig {
         minSdk = 24
-        targetSdk = 34
     }
 
     compileOptions {
@@ -23,6 +22,6 @@ android {
 }
 
 dependencies {
-    implementation("expo:expo-modules-core:2.0.0")
+    compileOnly(project(":expo-modules-core"))
     implementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")
 }

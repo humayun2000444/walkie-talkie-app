@@ -1,6 +1,6 @@
-import { NativeModulesProxy, EventEmitter } from 'expo-modules-core';
+import { requireNativeModule, EventEmitter } from 'expo-modules-core';
 
-const WifiDirectMesh = NativeModulesProxy.WifiDirectMesh;
+const WifiDirectMesh = requireNativeModule('WifiDirectMesh');
 const emitter = new EventEmitter(WifiDirectMesh);
 
 /**

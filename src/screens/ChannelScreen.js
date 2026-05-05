@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -7,135 +7,160 @@ import {
   FlatList,
   Alert,
   Platform,
-  TextInput,
 } from 'react-native';
 import { Audio } from 'expo-av';
-import * as Network from 'expo-network';
 import * as FileSystem from 'expo-file-system';
+import WifiDirect from '../../modules/wifi-direct';
+
+const CHAN_PREFIX = 'CHAN:';
 
 export default function ChannelScreen({ userName, channelName, mode, onBack }) {
   const [isTalking, setIsTalking] = useState(false);
   const [isInCall, setIsInCall] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [status, setStatus] = useState('Initializing...');
+  const [status, setStatus] = useState('Scanning for peers...');
   const [messages, setMessages] = useState([]);
-  const [connectedPeers, setConnectedPeers] = useState(0);
+  const [channelPeers, setChannelPeers] = useState([]); // confirmed same-channel peers
   const [isMuted, setIsMuted] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(true);
-  const [myIp, setMyIp] = useState('');
-  const [peerIp, setPeerIp] = useState('');
-  const [showPeerInput, setShowPeerInput] = useState(true);
+
   const recordingRef = useRef(null);
   const groupCallRecordingRef = useRef(null);
-  const pollingRef = useRef(null);
-  const lastTimestampRef = useRef(0);
+  const isInCallRef = useRef(false);
+  const isMutedRef = useRef(false);
+  const subscriptionsRef = useRef([]);
+  const rediscoverTimer = useRef(null);
 
+  const [amIGroupOwner, setAmIGroupOwner] = useState(false);
+  const isConnected = channelPeers.length > 0;
   const isGroupCall = mode === 'group-call';
-  const PORT = 8765;
+
+  const addMessage = useCallback((msg) => {
+    const time = new Date().toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    setMessages((prev) => [`${time} - ${msg}`, ...prev].slice(0, 50));
+  }, []);
+
+  // Send a small channel-handshake packet (not audio)
+  const sendChannelAnnounce = useCallback(async () => {
+    try {
+      const msg = CHAN_PREFIX + JSON.stringify({ channel: channelName, user: userName });
+      await WifiDirect.sendAudio(btoa(msg));
+    } catch (_) {}
+  }, [channelName, userName]);
 
   useEffect(() => {
     initAudio();
-    getMyIp();
+    initWifiDirect();
     return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
-      if (groupCallRecordingRef.current) {
-        groupCallRecordingRef.current.stopAndUnloadAsync();
-      }
+      cleanup();
     };
   }, []);
 
-  const addMessage = (msg) => {
-    const time = new Date().toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-    setMessages((prev) => [`${time} - ${msg}`, ...prev].slice(0, 50));
-  };
-
-  const getMyIp = async () => {
-    try {
-      const ip = await Network.getIpAddressAsync();
-      setMyIp(ip);
-      addMessage(`Your IP: ${ip}`);
-      setStatus(`Channel: ${channelName} • Your IP: ${ip}`);
-    } catch (err) {
-      addMessage(`Network error: ${err.message}`);
-    }
-  };
-
   const initAudio = async () => {
     try {
-      const { status } = await Audio.requestPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission needed', 'Microphone permission is required');
-        return;
-      }
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
         playThroughEarpieceAndroid: false,
         staysActiveInBackground: true,
       });
-      addMessage('Audio ready');
-    } catch (err) {
-      addMessage(`Audio init error: ${err.message}`);
-    }
+    } catch (_) {}
   };
 
-  const connectToPeer = async () => {
-    if (!peerIp.trim()) {
-      Alert.alert('Error', 'Enter the server IP address');
-      return;
-    }
+  const initWifiDirect = async () => {
     try {
-      // POST /join to register on the relay server
-      const response = await fetch(`http://${peerIp}:${PORT}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel: channelName, user: userName }),
-      });
-      const data = await response.json();
-      if (data.success) {
-        setIsConnected(true);
-        setConnectedPeers(data.userCount || 1);
-        setShowPeerInput(false);
-        setStatus(`Channel: ${channelName} • ${data.userCount} user(s) connected`);
-        addMessage(`Joined channel via server ${peerIp}. Users: ${data.userCount}`);
-        // Start polling for incoming audio
-        startListening();
-      } else {
-        Alert.alert('Error', 'Failed to join channel');
-      }
+      const subs = [
+        WifiDirect.onGroupCreated(() => {
+          setAmIGroupOwner(true);
+          setStatus('Group Owner — waiting for peers to join...');
+          addMessage('Acting as group owner (fastest path)');
+        }),
+
+        WifiDirect.onPeerDiscovered(({ peers }) => {
+          // Kotlin handles auto-connect and GO conflict resolution automatically.
+          // JS just updates status.
+          if (peers.length > 0) {
+            setStatus(`Found ${peers.length} nearby device(s), connecting...`);
+          }
+        }),
+
+        WifiDirect.onPeerConnected(({ deviceName }) => {
+          addMessage(`Device linked — verifying channel...`);
+          // Announce our channel to the newly connected peer
+          sendChannelAnnounce();
+        }),
+
+        WifiDirect.onPeerDisconnected(() => {
+          // Remove peers whose WiFi Direct link dropped
+          setChannelPeers((prev) => {
+            const updated = prev.slice(0, -1); // simplistic; refine if needed
+            return updated;
+          });
+          addMessage('A peer disconnected');
+        }),
+
+        WifiDirect.onAudioReceived(({ audio, from }) => {
+          // Check if it's a channel handshake message
+          try {
+            const decoded = atob(audio);
+            if (decoded.startsWith(CHAN_PREFIX)) {
+              const data = JSON.parse(decoded.slice(CHAN_PREFIX.length));
+              if (data.channel === channelName) {
+                setChannelPeers((prev) => {
+                  if (prev.find((p) => p.user === data.user)) return prev;
+                  return [...prev, { user: data.user, deviceName: from }];
+                });
+                setStatus(`Channel: ${channelName} • Mesh active`);
+                addMessage(`${data.user} joined the channel`);
+                // Reply so the other side also discovers us
+                sendChannelAnnounce();
+              } else {
+                addMessage(`Nearby device is on a different channel — ignored`);
+              }
+              return;
+            }
+          } catch (_) {
+            // Not a text packet — fall through to audio playback
+          }
+          // Real audio
+          addMessage(`Audio from ${from}`);
+          playReceivedAudio(audio);
+        }),
+
+        WifiDirect.onStatusChanged(({ status: s }) => {
+          setStatus(s);
+        }),
+
+        WifiDirect.onError(({ error }) => {
+          addMessage(`Error: ${error}`);
+        }),
+      ];
+      subscriptionsRef.current = subs;
+
+      await WifiDirect.initialize();
+      // Try to become Group Owner immediately — skips slow GO negotiation on connect
+      await WifiDirect.createGroup().catch(() => {});
+      await WifiDirect.startDiscovery();
+      addMessage('Scanning — anyone on the same channel code will appear automatically');
+
+      // Re-run discovery every 60s (WiFi Direct scan times out)
+      rediscoverTimer.current = setInterval(() => {
+        WifiDirect.startDiscovery().catch(() => {});
+      }, 60000);
     } catch (err) {
-      Alert.alert('Connection Error', `Could not reach server at ${peerIp}:${PORT}\n${err.message}`);
-      addMessage(`Connection failed: ${err.message}`);
+      addMessage(`WiFi Direct error: ${err.message}`);
     }
   };
 
-  const startListening = () => {
-    pollingRef.current = setInterval(async () => {
-      try {
-        const since = lastTimestampRef.current;
-        const url = `http://${peerIp}:${PORT}/receive?channel=${encodeURIComponent(channelName)}&user=${encodeURIComponent(userName)}&since=${since}`;
-        const response = await fetch(url).catch(() => null);
-
-        if (response && response.ok) {
-          const data = await response.json();
-          // Update connected users count
-          if (data.userCount) {
-            setConnectedPeers(data.userCount);
-          }
-          if (data.audio && data.audio.audio) {
-            lastTimestampRef.current = data.audio.timestamp;
-            addMessage(`Receiving audio from ${data.audio.from}...`);
-            await playReceivedAudio(data.audio.audio);
-          }
-        }
-      } catch (e) {
-        // Silently fail on polling - server may not be ready
-      }
-    }, 500);
+  const cleanup = async () => {
+    subscriptionsRef.current.forEach((sub) => sub.remove());
+    clearInterval(rediscoverTimer.current);
+    isInCallRef.current = false;
+    if (groupCallRecordingRef.current) {
+      await groupCallRecordingRef.current.stopAndUnloadAsync().catch(() => {});
+    }
+    await WifiDirect.destroy().catch(() => {});
   };
 
   const playReceivedAudio = async (base64Audio) => {
@@ -146,50 +171,39 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
       });
       const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
       await sound.playAsync();
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.didJustFinish) sound.unloadAsync();
+      sound.setOnPlaybackStatusUpdate((s) => {
+        if (s.didJustFinish) sound.unloadAsync();
       });
     } catch (err) {
       addMessage(`Playback error: ${err.message}`);
     }
   };
 
-  const sendAudioToPeer = async (uri) => {
+  const sendAudio = async (uri) => {
     try {
       const base64 = await FileSystem.readAsStringAsync(uri, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      await fetch(`http://${peerIp}:${PORT}/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: userName,
-          channel: channelName,
-          audio: base64,
-        }),
-      });
-      addMessage('Audio sent!');
+      await WifiDirect.sendAudio(base64);
+      addMessage('Transmitted');
     } catch (err) {
       addMessage(`Send error: ${err.message}`);
     }
   };
 
-  // === PTT Mode ===
+  // === PTT ===
   const startTalking = async () => {
     if (!isConnected) {
-      Alert.alert('Not Connected', 'Enter peer IP first');
+      Alert.alert('No peers on this channel', 'Wait for others to join the same channel code');
       return;
     }
     try {
       const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
+      await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
       await recording.startAsync();
       recordingRef.current = recording;
       setIsTalking(true);
       setStatus('TRANSMITTING...');
-      addMessage('Recording...');
     } catch (err) {
       addMessage(`Recording error: ${err.message}`);
     }
@@ -198,55 +212,48 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
   const stopTalking = async () => {
     try {
       setIsTalking(false);
-      setStatus(`Channel: ${channelName} • Connected to ${peerIp}`);
-
+      setStatus(`Channel: ${channelName} • Mesh active`);
       if (recordingRef.current) {
         await recordingRef.current.stopAndUnloadAsync();
         const uri = recordingRef.current.getURI();
         recordingRef.current = null;
-
-        if (uri && isConnected) {
-          await sendAudioToPeer(uri);
-        }
+        if (uri && isConnected) await sendAudio(uri);
       }
     } catch (err) {
       addMessage(`Error: ${err.message}`);
     }
   };
 
-  // === Group Call Mode ===
+  // === Group Call ===
   const startGroupCall = async () => {
     if (!isConnected) {
-      Alert.alert('Not Connected', 'Enter peer IP first');
+      Alert.alert('No peers on this channel', 'Wait for others to join the same channel code');
       return;
     }
     setIsInCall(true);
+    isInCallRef.current = true;
     setStatus(`Channel: ${channelName} • In Call`);
     addMessage('Group call started');
-
-    // Continuous recording loop
     continuousRecord();
   };
 
   const continuousRecord = async () => {
-    if (!isInCall) return;
+    if (!isInCallRef.current) return;
     try {
       const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
+      await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
       await recording.startAsync();
       groupCallRecordingRef.current = recording;
 
-      // Record for 2 seconds then send and restart
       setTimeout(async () => {
-        if (groupCallRecordingRef.current && isInCall && !isMuted) {
+        if (!isInCallRef.current) return;
+        if (groupCallRecordingRef.current && !isMutedRef.current) {
           await groupCallRecordingRef.current.stopAndUnloadAsync();
           const uri = groupCallRecordingRef.current.getURI();
           groupCallRecordingRef.current = null;
-          if (uri) await sendAudioToPeer(uri);
-          if (isInCall) continuousRecord();
+          if (uri) await sendAudio(uri);
         }
+        continuousRecord();
       }, 2000);
     } catch (err) {
       addMessage(`Call error: ${err.message}`);
@@ -255,17 +262,20 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
 
   const endGroupCall = async () => {
     setIsInCall(false);
+    isInCallRef.current = false;
     if (groupCallRecordingRef.current) {
-      await groupCallRecordingRef.current.stopAndUnloadAsync();
+      await groupCallRecordingRef.current.stopAndUnloadAsync().catch(() => {});
       groupCallRecordingRef.current = null;
     }
-    setStatus(`Channel: ${channelName} • Connected`);
+    setStatus(`Channel: ${channelName} • Mesh active`);
     addMessage('Group call ended');
   };
 
   const toggleMute = () => {
-    setIsMuted(!isMuted);
-    addMessage(isMuted ? 'Unmuted' : 'Muted');
+    const next = !isMuted;
+    setIsMuted(next);
+    isMutedRef.current = next;
+    addMessage(next ? 'Muted' : 'Unmuted');
   };
 
   const toggleSpeaker = async () => {
@@ -284,7 +294,13 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
     <Text style={styles.messageText}>{item}</Text>
   );
 
-  // === Group Call Controls UI ===
+  const renderChannelPeer = ({ item }) => (
+    <View style={styles.peerItem}>
+      <View style={styles.peerDot} />
+      <Text style={styles.peerName}>{item.user}</Text>
+    </View>
+  );
+
   const renderGroupCallControls = () => (
     <View style={styles.groupCallContainer}>
       {!isInCall ? (
@@ -319,14 +335,13 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
             </TouchableOpacity>
           </View>
           <Text style={styles.callPeersText}>
-            {connectedPeers} participant{connectedPeers !== 1 ? 's' : ''}
+            {channelPeers.length + 1} participant{channelPeers.length !== 0 ? 's' : ''}
           </Text>
         </View>
       )}
     </View>
   );
 
-  // === PTT Controls UI ===
   const renderPTTControls = () => (
     <View style={styles.pttContainer}>
       <TouchableOpacity
@@ -356,11 +371,9 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
             {status}
           </Text>
         </View>
-        <View
-          style={[styles.badge, { borderColor: isConnected ? '#4CAF50' : '#f44' }]}
-        >
-          <Text style={[styles.badgeText, { color: isConnected ? '#4CAF50' : '#f44' }]}>
-            {isConnected ? 'Connected' : 'Offline'}
+        <View style={[styles.badge, { borderColor: isConnected ? '#4CAF50' : '#FF8C00' }]}>
+          <Text style={[styles.badgeText, { color: isConnected ? '#4CAF50' : '#FF8C00' }]}>
+            {isConnected ? `${channelPeers.length} peer${channelPeers.length !== 1 ? 's' : ''}` : 'Scanning'}
           </Text>
         </View>
       </View>
@@ -369,29 +382,22 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
       <View style={styles.modeIndicator}>
         <Text style={styles.modeText}>
           {isGroupCall ? '📞 Group Call Mode' : '📻 Walkie-Talkie Mode'}
+          {amIGroupOwner ? '  •  Hub' : '  •  Client'}
         </Text>
       </View>
 
-      {/* Peer Connection Input */}
-      {showPeerInput && (
-        <View style={styles.peerConnectContainer}>
-          <Text style={styles.myIpText}>Your IP: {myIp}</Text>
-          <Text style={styles.instructionText}>
-            Enter the server IP (computer running node server.js):
-          </Text>
-          <View style={styles.peerInputRow}>
-            <TextInput
-              style={styles.peerInput}
-              placeholder="e.g. 192.168.0.205"
-              placeholderTextColor="#666"
-              value={peerIp}
-              onChangeText={setPeerIp}
-              keyboardType="numeric"
-            />
-            <TouchableOpacity style={styles.connectBtn} onPress={connectToPeer}>
-              <Text style={styles.connectBtnText}>Connect</Text>
-            </TouchableOpacity>
-          </View>
+      {/* Channel peers (confirmed same channel) */}
+      {channelPeers.length > 0 && (
+        <View style={styles.peersPanel}>
+          <Text style={styles.peersPanelTitle}>On this channel</Text>
+          <FlatList
+            data={channelPeers}
+            renderItem={renderChannelPeer}
+            keyExtractor={(item) => item.user}
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.peersListContent}
+          />
         </View>
       )}
 
@@ -400,9 +406,10 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
         {messages.length === 0 ? (
           <View style={styles.emptyLog}>
             <Text style={styles.emptyIcon}>📡</Text>
-          <Text style={styles.emptyText}>
-              Enter the server IP to connect{'\n'}
-              Both phones must be on the same WiFi as the server
+            <Text style={styles.emptyText}>
+              Scanning for devices on channel{'\n'}
+              <Text style={{ color: '#FF8C00', fontWeight: 'bold' }}>{channelName}</Text>
+              {'\n\n'}Anyone who joins the same channel code{'\n'}will appear here automatically
             </Text>
           </View>
         ) : (
@@ -454,53 +461,34 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255, 140, 0, 0.3)',
   },
   modeText: { color: '#FF8C00', fontSize: 13, fontWeight: '600' },
-  // Peer Connect
-  peerConnectContainer: {
-    margin: 16,
-    padding: 16,
-    backgroundColor: 'rgba(76, 175, 80, 0.1)',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(76, 175, 80, 0.3)',
-  },
-  myIpText: {
-    color: '#4CAF50',
-    fontSize: 16,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 8,
-  },
-  instructionText: {
+  peersPanel: { marginHorizontal: 16, marginTop: 12 },
+  peersPanelTitle: {
     color: '#888',
-    fontSize: 12,
-    textAlign: 'center',
-    marginBottom: 12,
+    fontSize: 11,
+    fontWeight: '600',
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
   },
-  peerInputRow: {
+  peersListContent: { gap: 8 },
+  peerItem: {
     flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(76, 175, 80, 0.1)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#4CAF50',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
     gap: 8,
   },
-  peerInput: {
-    flex: 1,
-    height: 44,
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    color: '#fff',
-    fontSize: 16,
-    borderWidth: 1,
-    borderColor: '#444',
-  },
-  connectBtn: {
-    height: 44,
-    paddingHorizontal: 16,
+  peerDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
     backgroundColor: '#4CAF50',
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
-  connectBtnText: { color: '#fff', fontWeight: 'bold' },
-  // Log
+  peerName: { color: '#fff', fontSize: 13, fontWeight: '600' },
   logContainer: {
     flex: 1,
     margin: 16,
@@ -512,9 +500,8 @@ const styles = StyleSheet.create({
   },
   emptyLog: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   emptyIcon: { fontSize: 48, marginBottom: 12 },
-  emptyText: { color: '#666', textAlign: 'center', lineHeight: 22 },
+  emptyText: { color: '#666', textAlign: 'center', lineHeight: 24 },
   messageText: { color: '#999', fontSize: 12, paddingVertical: 2 },
-  // PTT
   pttContainer: { alignItems: 'center', paddingVertical: 24 },
   pttButton: {
     width: 140,
@@ -536,7 +523,6 @@ const styles = StyleSheet.create({
   },
   pttIcon: { fontSize: 48 },
   pttText: { color: '#FF8C00', fontSize: 11, fontWeight: 'bold', marginTop: 8 },
-  // Group Call
   groupCallContainer: { alignItems: 'center', paddingVertical: 24, paddingHorizontal: 16 },
   startCallButton: {
     width: '100%',

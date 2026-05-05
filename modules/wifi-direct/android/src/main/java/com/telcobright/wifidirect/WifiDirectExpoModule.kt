@@ -24,7 +24,8 @@ class WifiDirectExpoModule : Module() {
             "onPeerDisconnected",
             "onAudioReceived",
             "onStatusChanged",
-            "onError"
+            "onError",
+            "onGroupCreated"
         )
 
         // Initialize WiFi Direct
@@ -37,9 +38,14 @@ class WifiDirectExpoModule : Module() {
                     val peerList = peers.map { mapOf(
                         "deviceName" to it.deviceName,
                         "deviceAddress" to it.deviceAddress,
-                        "isConnected" to it.isConnected
+                        "isConnected" to it.isConnected,
+                        "isGroupOwner" to it.isGroupOwner
                     )}
                     sendEvent("onPeerDiscovered", mapOf("peers" to peerList))
+                }
+
+                wifiDirectManager?.onGroupCreated = {
+                    sendEvent("onGroupCreated", emptyMap<String, Any>())
                 }
 
                 wifiDirectManager?.onPeerConnected = { address, name ->
@@ -94,6 +100,21 @@ class WifiDirectExpoModule : Module() {
             } catch (e: Exception) {
                 promise.reject("STOP_ERROR", e.message, e)
             }
+        }
+
+        // Create an autonomous P2P group (become Group Owner immediately)
+        AsyncFunction("createGroup") { promise: Promise ->
+            try {
+                wifiDirectManager?.createGroup()
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("CREATE_GROUP_ERROR", e.message, e)
+            }
+        }
+
+        // Get this device's WiFi Direct address
+        Function("getDeviceAddress") {
+            wifiDirectManager?.getDeviceAddress() ?: ""
         }
 
         // Connect to a peer by address

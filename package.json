@@ -12,10 +12,10 @@
     "expo": "~54.0.33",
     "expo-av": "^16.0.8",
     "expo-file-system": "~18.0.12",
-    "expo-network": "^55.0.13",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
-    "react-native": "0.81.5"
+    "react-native": "0.81.5",
+    "wifi-direct-mesh": "file:./modules/wifi-direct"
   },
   "private": true
 }

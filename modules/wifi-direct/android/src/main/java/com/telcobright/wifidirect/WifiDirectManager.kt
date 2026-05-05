@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.wifi.p2p.*
 import android.net.wifi.p2p.WifiP2pManager.*
+import android.net.wifi.WpsInfo
 import android.os.Build
 import android.util.Log
 import java.net.*
@@ -34,6 +35,9 @@ class WifiDirectManager(private val context: Context) {
     // Connected peers: deviceAddress -> PeerConnection
     private val connectedPeers = ConcurrentHashMap<String, PeerConnection>()
 
+    // Tracks addresses where a connect() call is already in-flight
+    private val connectingPeers = ConcurrentHashMap.newKeySet<String>()
+
     // Discovered peers
     private val discoveredPeers = CopyOnWriteArrayList<WifiP2pDevice>()
 
@@ -44,6 +48,7 @@ class WifiDirectManager(private val context: Context) {
     var onAudioReceived: ((ByteArray, String) -> Unit)? = null
     var onStatusChanged: ((String) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
+    var onGroupCreated: (() -> Unit)? = null
 
     // Server thread for receiving connections
     private var serverThread: Thread? = null
@@ -53,6 +58,7 @@ class WifiDirectManager(private val context: Context) {
     private var myDeviceName: String = "Unknown"
     private var myDeviceAddress: String = ""
     private var isGroupOwner = false
+    private var autonomousGO = false  // true when we explicitly called createGroup()
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -74,11 +80,35 @@ class WifiDirectManager(private val context: Context) {
                             PeerInfo(
                                 deviceName = device.deviceName,
                                 deviceAddress = device.deviceAddress,
-                                isConnected = connectedPeers.containsKey(device.deviceAddress)
+                                isConnected = connectedPeers.containsKey(device.deviceAddress),
+                                isGroupOwner = getGroupCapability(device)
                             )
                         }
                         onPeerDiscovered?.invoke(peerInfoList)
                         onStatusChanged?.invoke("Found ${peers.deviceList.size} peers")
+
+                        // Auto-connect based on GO role
+                        for (device in peers.deviceList) {
+                            if (connectedPeers.containsKey(device.deviceAddress)) continue
+                            val peerIsGO = getGroupCapability(device)
+
+                            if (autonomousGO) {
+                                if (peerIsGO && device.deviceAddress < myDeviceAddress) {
+                                    // GO conflict: peer has lower MAC → we yield and join them
+                                    Log.d(TAG, "GO conflict: yielding to ${device.deviceAddress}")
+                                    autonomousGO = false
+                                    manager?.removeGroup(channel, object : ActionListener {
+                                        override fun onSuccess() { connectToPeer(device.deviceAddress) }
+                                        override fun onFailure(r: Int) { connectToPeer(device.deviceAddress) }
+                                    })
+                                }
+                                // peer with higher MAC → they yield to us (do nothing)
+                                // non-GO peer → they connect to us (do nothing)
+                            } else {
+                                // We're a client (or createGroup failed) → connect to any peer
+                                connectToPeer(device.deviceAddress)
+                            }
+                        }
                     }
                 }
                 WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
@@ -94,6 +124,8 @@ class WifiDirectManager(private val context: Context) {
                             handleConnectionInfo(info)
                         }
                     } else {
+                        connectingPeers.clear()
+                        autonomousGO = false
                         onStatusChanged?.invoke("Disconnected")
                     }
                 }
@@ -155,20 +187,65 @@ class WifiDirectManager(private val context: Context) {
         manager?.stopPeerDiscovery(channel, null)
     }
 
+    fun createGroup() {
+        manager?.createGroup(channel, object : ActionListener {
+            override fun onSuccess() {
+                autonomousGO = true
+                isGroupOwner = true
+                onStatusChanged?.invoke("Group Owner — waiting for peers")
+                onGroupCreated?.invoke()
+                Log.d(TAG, "Autonomous group created")
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(TAG, "createGroup failed ($reason), will connect as client")
+                onStatusChanged?.invoke("Searching for group owner...")
+            }
+        })
+    }
+
+    fun getDeviceAddress(): String = myDeviceAddress
+    fun getDeviceName(): String = myDeviceName
+
+    // groupCapability is a public int field but not always in the compile-time API surface
+    private fun getGroupCapability(device: WifiP2pDevice): Boolean {
+        return try {
+            val field = WifiP2pDevice::class.java.getField("groupCapability")
+            (field.getInt(device) and 0x01) != 0
+        } catch (_: Exception) { false }
+    }
+
     fun connectToPeer(deviceAddress: String) {
+        if (connectingPeers.contains(deviceAddress) || connectedPeers.containsKey(deviceAddress)) {
+            Log.d(TAG, "Already connecting/connected to $deviceAddress, skipping")
+            return
+        }
+        connectingPeers.add(deviceAddress)
+
         val config = WifiP2pConfig().apply {
             this.deviceAddress = deviceAddress
+            wps.setup = WpsInfo.PBC  // fresh connection, skip stale persistent groups
+            groupOwnerIntent = 15    // prefer to be group owner
         }
+        doConnect(config)
+    }
 
+    private fun doConnect(config: WifiP2pConfig) {
         manager?.connect(channel, config, object : ActionListener {
             override fun onSuccess() {
-                onStatusChanged?.invoke("Connecting to $deviceAddress...")
-                Log.d(TAG, "Connection initiated to $deviceAddress")
+                onStatusChanged?.invoke("Connecting to ${config.deviceAddress}...")
+                Log.d(TAG, "Connection initiated to ${config.deviceAddress}")
             }
 
             override fun onFailure(reason: Int) {
-                onError?.invoke("Connection failed: $reason")
-                Log.e(TAG, "Connection failed: $reason")
+                connectingPeers.remove(config.deviceAddress)
+                if (reason == BUSY) {
+                    // BUSY means P2P stack is already handling a connection (e.g. incoming invitation).
+                    // Do NOT retry — the invitation will complete via WIFI_P2P_CONNECTION_CHANGED_ACTION.
+                    Log.w(TAG, "connect() busy for ${config.deviceAddress} — waiting for broadcast")
+                } else {
+                    onError?.invoke("Connection failed: $reason")
+                    Log.e(TAG, "Connection failed: $reason for ${config.deviceAddress}")
+                }
             }
         })
     }
@@ -243,22 +320,34 @@ class WifiDirectManager(private val context: Context) {
 
     private fun startServer() {
         serverThread = Thread {
-            try {
-                val serverSocket = ServerSocket(PORT)
-                Log.d(TAG, "Server listening on port $PORT")
-
-                while (isRunning) {
-                    try {
-                        val clientSocket = serverSocket.accept()
-                        handleIncomingConnection(clientSocket)
-                    } catch (e: Exception) {
-                        if (isRunning) Log.e(TAG, "Server accept error: ${e.message}")
-                    }
+            var serverSocket: ServerSocket? = null
+            for (attempt in 1..5) {
+                try {
+                    val s = ServerSocket()
+                    s.reuseAddress = true
+                    s.bind(InetSocketAddress(PORT))
+                    serverSocket = s
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "Port $PORT busy (attempt $attempt/5): ${e.message}")
+                    Thread.sleep(2000)
                 }
-                serverSocket.close()
-            } catch (e: Exception) {
-                Log.e(TAG, "Server start error: ${e.message}")
             }
+            if (serverSocket == null) {
+                Log.e(TAG, "Could not bind to port $PORT after 5 attempts")
+                onError?.invoke("Audio server could not start (port busy)")
+                return@Thread
+            }
+            Log.d(TAG, "Server listening on port $PORT")
+            while (isRunning) {
+                try {
+                    val clientSocket = serverSocket.accept()
+                    handleIncomingConnection(clientSocket)
+                } catch (e: Exception) {
+                    if (isRunning) Log.e(TAG, "Server accept error: ${e.message}")
+                }
+            }
+            serverSocket.close()
         }.apply { isDaemon = true; start() }
     }
 
@@ -290,6 +379,7 @@ class WifiDirectManager(private val context: Context) {
                     2 -> {
                         // Peer registration
                         val peerAddress = socket.inetAddress.hostAddress ?: ""
+                        connectingPeers.remove(peerAddress)
                         val peerConn = PeerConnection(peerAddress, senderName, PORT)
                         connectedPeers[peerAddress] = peerConn
                         onPeerConnected?.invoke(peerAddress, senderName)
@@ -319,6 +409,7 @@ class WifiDirectManager(private val context: Context) {
                 output.flush()
 
                 // Register this as a connected peer
+                connectingPeers.remove(serverAddress)
                 val peerConn = PeerConnection(serverAddress, "GroupOwner", PORT)
                 connectedPeers[serverAddress] = peerConn
                 onPeerConnected?.invoke(serverAddress, "GroupOwner")
@@ -381,5 +472,6 @@ class PeerConnection(
 data class PeerInfo(
     val deviceName: String,
     val deviceAddress: String,
-    val isConnected: Boolean
+    val isConnected: Boolean,
+    val isGroupOwner: Boolean = false
 )

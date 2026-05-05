@@ -1,0 +1,9 @@
+{
+  "name": "wifi-direct-mesh",
+  "version": "1.0.0",
+  "description": "WiFi Direct mesh networking module for Expo",
+  "main": "index.js",
+  "peerDependencies": {
+    "expo-modules-core": "*"
+  }
+}
