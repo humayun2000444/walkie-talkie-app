@@ -1,20 +1,34 @@
+import React, { useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+import HomeScreen from './src/screens/HomeScreen';
+import ChannelScreen from './src/screens/ChannelScreen';
 
 export default function App() {
+  const [screen, setScreen] = useState('home');
+  const [config, setConfig] = useState({ userName: '', channelName: '', mode: 'walkie-talkie' });
+
+  const joinChannel = (userName, channelName, mode) => {
+    setConfig({ userName, channelName, mode });
+    setScreen('channel');
+  };
+
+  const goBack = () => {
+    setScreen('home');
+  };
+
   return (
-    <View style={styles.container}>
-      <Text>Open up App.js to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
+    <>
+      <StatusBar style="light" />
+      {screen === 'home' ? (
+        <HomeScreen onJoinChannel={joinChannel} />
+      ) : (
+        <ChannelScreen
+          userName={config.userName}
+          channelName={config.channelName}
+          mode={config.mode}
+          onBack={goBack}
+        />
+      )}
+    </>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
