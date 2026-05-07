@@ -158,6 +158,36 @@ class WifiDirectExpoModule : Module() {
             wifiDirectManager?.getConnectedPeerNames() ?: emptyList<String>()
         }
 
+        // Start native audio streaming (group call)
+        AsyncFunction("startGroupCallStream") { promise: Promise ->
+            try {
+                wifiDirectManager?.startGroupCallStream()
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("STREAM_ERROR", e.message, e)
+            }
+        }
+
+        // Stop native audio streaming
+        AsyncFunction("stopGroupCallStream") { promise: Promise ->
+            try {
+                wifiDirectManager?.stopGroupCallStream()
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("STREAM_ERROR", e.message, e)
+            }
+        }
+
+        // Set stream mute state
+        AsyncFunction("setStreamMuted") { muted: Boolean, promise: Promise ->
+            try {
+                wifiDirectManager?.setStreamMuted(muted)
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("MUTE_ERROR", e.message, e)
+            }
+        }
+
         // Cleanup
         AsyncFunction("destroy") { promise: Promise ->
             try {

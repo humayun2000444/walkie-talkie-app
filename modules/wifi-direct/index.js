@@ -38,6 +38,11 @@ export default {
   stopDiscovery: () => WifiDirectMesh.stopDiscovery(),
 
   /**
+   * Create a WiFi Direct group (become Group Owner)
+   */
+  createGroup: () => WifiDirectMesh.createGroup(),
+
+  /**
    * Connect to a peer by device address
    * @param {string} deviceAddress - MAC address of the peer
    */
@@ -66,6 +71,21 @@ export default {
    * @returns {string[]}
    */
   getConnectedPeerNames: () => WifiDirectMesh.getConnectedPeerNames(),
+
+  /**
+   * Start native real-time audio streaming (group call with echo cancellation)
+   */
+  startGroupCallStream: () => WifiDirectMesh.startGroupCallStream(),
+
+  /**
+   * Stop native audio streaming
+   */
+  stopGroupCallStream: () => WifiDirectMesh.stopGroupCallStream(),
+
+  /**
+   * Set mute state for streaming
+   */
+  setStreamMuted: (muted) => WifiDirectMesh.setStreamMuted(muted),
 
   /**
    * Destroy and cleanup
@@ -109,4 +129,10 @@ export default {
    * @param {function} callback - ({ error: string })
    */
   onError: (callback) => emitter.addListener('onError', callback),
+
+  /**
+   * Called when a WiFi Direct group is created (device becomes Group Owner)
+   * @param {function} callback - ()
+   */
+  onGroupCreated: (callback) => emitter.addListener('onGroupCreated', callback),
 };

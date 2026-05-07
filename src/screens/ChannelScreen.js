@@ -20,6 +20,7 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
   const [status, setStatus] = useState('Scanning for peers...');
   const [messages, setMessages] = useState([]);
   const [channelPeers, setChannelPeers] = useState([]); // confirmed same-channel peers
+  const [discoveredPeers, setDiscoveredPeers] = useState([]); // nearby WiFi Direct devices
   const [isMuted, setIsMuted] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(true);
 
@@ -40,6 +41,15 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
     });
     setMessages((prev) => [`${time} - ${msg}`, ...prev].slice(0, 50));
   }, []);
+
+  const connectToDevice = useCallback(async (deviceAddress, deviceName) => {
+    try {
+      addMessage(`Connecting to ${deviceName || deviceAddress}...`);
+      await WifiDirect.connectToPeer(deviceAddress);
+    } catch (err) {
+      addMessage(`Connect error: ${err.message}`);
+    }
+  }, [addMessage]);
 
   // Send a small channel-handshake packet (not audio)
   const sendChannelAnnounce = useCallback(async () => {
@@ -78,10 +88,9 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
         }),
 
         WifiDirect.onPeerDiscovered(({ peers }) => {
-          // Kotlin handles auto-connect and GO conflict resolution automatically.
-          // JS just updates status.
+          setDiscoveredPeers(peers);
           if (peers.length > 0) {
-            setStatus(`Found ${peers.length} nearby device(s), connecting...`);
+            setStatus(`Found ${peers.length} nearby device(s) — tap to connect`);
           }
         }),
 
@@ -92,12 +101,16 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
         }),
 
         WifiDirect.onPeerDisconnected(() => {
-          // Remove peers whose WiFi Direct link dropped
-          setChannelPeers((prev) => {
-            const updated = prev.slice(0, -1); // simplistic; refine if needed
-            return updated;
-          });
-          addMessage('A peer disconnected');
+          // Clear all peers and stop call if active
+          setChannelPeers([]);
+          setDiscoveredPeers([]);
+          if (isInCallRef.current) {
+            WifiDirect.stopGroupCallStream().catch(() => {});
+            setIsInCall(false);
+            isInCallRef.current = false;
+          }
+          setStatus('Peer disconnected — tap a device to reconnect');
+          addMessage('Peer disconnected');
         }),
 
         WifiDirect.onAudioReceived(({ audio, from }) => {
@@ -107,14 +120,18 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
             if (decoded.startsWith(CHAN_PREFIX)) {
               const data = JSON.parse(decoded.slice(CHAN_PREFIX.length));
               if (data.channel === channelName) {
+                let isNew = false;
                 setChannelPeers((prev) => {
                   if (prev.find((p) => p.user === data.user)) return prev;
+                  isNew = true;
                   return [...prev, { user: data.user, deviceName: from }];
                 });
                 setStatus(`Channel: ${channelName} • Mesh active`);
-                addMessage(`${data.user} joined the channel`);
-                // Reply so the other side also discovers us
-                sendChannelAnnounce();
+                if (isNew) {
+                  addMessage(`${data.user} joined the channel`);
+                  // Reply only once so the other side also discovers us
+                  sendChannelAnnounce();
+                }
               } else {
                 addMessage(`Nearby device is on a different channel — ignored`);
               }
@@ -123,9 +140,10 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
           } catch (_) {
             // Not a text packet — fall through to audio playback
           }
-          // Real audio
+          // Real audio — only play if we haven't left the channel
           addMessage(`Audio from ${from}`);
           playReceivedAudio(audio);
+
         }),
 
         WifiDirect.onStatusChanged(({ status: s }) => {
@@ -139,10 +157,8 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
       subscriptionsRef.current = subs;
 
       await WifiDirect.initialize();
-      // Try to become Group Owner immediately — skips slow GO negotiation on connect
-      await WifiDirect.createGroup().catch(() => {});
       await WifiDirect.startDiscovery();
-      addMessage('Scanning — anyone on the same channel code will appear automatically');
+      addMessage('Scanning — tap a discovered device to connect');
 
       // Re-run discovery every 60s (WiFi Direct scan times out)
       rediscoverTimer.current = setInterval(() => {
@@ -156,23 +172,30 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
   const cleanup = async () => {
     subscriptionsRef.current.forEach((sub) => sub.remove());
     clearInterval(rediscoverTimer.current);
-    isInCallRef.current = false;
-    if (groupCallRecordingRef.current) {
-      await groupCallRecordingRef.current.stopAndUnloadAsync().catch(() => {});
+    if (isInCallRef.current) {
+      await WifiDirect.stopGroupCallStream().catch(() => {});
     }
+    isInCallRef.current = false;
     await WifiDirect.destroy().catch(() => {});
   };
 
+  let audioCounter = 0;
   const playReceivedAudio = async (base64Audio) => {
     try {
-      const fileUri = FileSystem.cacheDirectory + 'received_audio.m4a';
+      // Use unique filename to avoid file locking between concurrent playbacks
+      const fileUri = FileSystem.cacheDirectory + `audio_${++audioCounter}.m4a`;
       await FileSystem.writeAsStringAsync(fileUri, base64Audio, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
-      await sound.playAsync();
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: fileUri },
+        { shouldPlay: true } // start playing immediately
+      );
       sound.setOnPlaybackStatusUpdate((s) => {
-        if (s.didJustFinish) sound.unloadAsync();
+        if (s.didJustFinish) {
+          sound.unloadAsync();
+          FileSystem.deleteAsync(fileUri, { idempotent: true }).catch(() => {});
+        }
       });
     } catch (err) {
       addMessage(`Playback error: ${err.message}`);
@@ -191,6 +214,28 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
     }
   };
 
+  // Low-latency recording config
+  const LOW_LATENCY_RECORDING = {
+    isMeteringEnabled: false,
+    android: {
+      extension: '.m4a',
+      outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+      audioEncoder: Audio.AndroidAudioEncoder.AAC,
+      sampleRate: 16000,
+      numberOfChannels: 1,
+      bitRate: 32000,
+    },
+    ios: {
+      extension: '.m4a',
+      outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
+      audioQuality: Audio.IOSAudioQuality.MIN,
+      sampleRate: 16000,
+      numberOfChannels: 1,
+      bitRate: 32000,
+    },
+    web: {},
+  };
+
   // === PTT ===
   const startTalking = async () => {
     if (!isConnected) {
@@ -199,7 +244,7 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
     }
     try {
       const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      await recording.prepareToRecordAsync(LOW_LATENCY_RECORDING);
       await recording.startAsync();
       recordingRef.current = recording;
       setIsTalking(true);
@@ -224,37 +269,18 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
     }
   };
 
-  // === Group Call ===
+  // === Group Call (native real-time streaming) ===
   const startGroupCall = async () => {
     if (!isConnected) {
       Alert.alert('No peers on this channel', 'Wait for others to join the same channel code');
       return;
     }
-    setIsInCall(true);
-    isInCallRef.current = true;
-    setStatus(`Channel: ${channelName} • In Call`);
-    addMessage('Group call started');
-    continuousRecord();
-  };
-
-  const continuousRecord = async () => {
-    if (!isInCallRef.current) return;
     try {
-      const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-      await recording.startAsync();
-      groupCallRecordingRef.current = recording;
-
-      setTimeout(async () => {
-        if (!isInCallRef.current) return;
-        if (groupCallRecordingRef.current && !isMutedRef.current) {
-          await groupCallRecordingRef.current.stopAndUnloadAsync();
-          const uri = groupCallRecordingRef.current.getURI();
-          groupCallRecordingRef.current = null;
-          if (uri) await sendAudio(uri);
-        }
-        continuousRecord();
-      }, 2000);
+      setIsInCall(true);
+      isInCallRef.current = true;
+      setStatus(`Channel: ${channelName} • In Call`);
+      await WifiDirect.startGroupCallStream();
+      addMessage('Group call started (native streaming + echo cancellation)');
     } catch (err) {
       addMessage(`Call error: ${err.message}`);
     }
@@ -263,18 +289,20 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
   const endGroupCall = async () => {
     setIsInCall(false);
     isInCallRef.current = false;
-    if (groupCallRecordingRef.current) {
-      await groupCallRecordingRef.current.stopAndUnloadAsync().catch(() => {});
-      groupCallRecordingRef.current = null;
-    }
+    try {
+      await WifiDirect.stopGroupCallStream();
+    } catch (_) {}
     setStatus(`Channel: ${channelName} • Mesh active`);
     addMessage('Group call ended');
   };
 
-  const toggleMute = () => {
+  const toggleMute = async () => {
     const next = !isMuted;
     setIsMuted(next);
     isMutedRef.current = next;
+    try {
+      await WifiDirect.setStreamMuted(next);
+    } catch (_) {}
     addMessage(next ? 'Muted' : 'Unmuted');
   };
 
@@ -401,6 +429,30 @@ export default function ChannelScreen({ userName, channelName, mode, onBack }) {
         </View>
       )}
 
+      {/* Discovered Devices (tap to connect) */}
+      {discoveredPeers.length > 0 && !isConnected && (
+        <View style={styles.peersPanel}>
+          <Text style={styles.peersPanelTitle}>Nearby Devices — Tap to Connect</Text>
+          <FlatList
+            data={discoveredPeers}
+            renderItem={({ item }) => (
+              <TouchableOpacity
+                style={styles.discoveredItem}
+                onPress={() => connectToDevice(item.deviceAddress, item.deviceName)}
+              >
+                <Text style={styles.discoveredName}>
+                  {item.deviceName || item.deviceAddress}
+                </Text>
+                <Text style={styles.connectText}>Connect</Text>
+              </TouchableOpacity>
+            )}
+            keyExtractor={(item) => item.deviceAddress}
+            showsVerticalScrollIndicator={false}
+            style={{ maxHeight: 120 }}
+          />
+        </View>
+      )}
+
       {/* Activity Log */}
       <View style={styles.logContainer}>
         {messages.length === 0 ? (
@@ -489,6 +541,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#4CAF50',
   },
   peerName: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  discoveredItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(33, 150, 243, 0.1)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2196F3',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 6,
+  },
+  discoveredName: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  connectText: { color: '#2196F3', fontSize: 13, fontWeight: 'bold' },
   logContainer: {
     flex: 1,
     margin: 16,
