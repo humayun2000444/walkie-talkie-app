@@ -5,15 +5,15 @@ Offline walkie-talkie for Android using WiFi Direct mesh networking. No internet
 ## How It Works
 
 - Devices discover each other via WiFi Direct (P2P radio)
-- One device becomes **Group Owner** (hub) immediately on join — skips slow negotiation
-- Other devices auto-connect as clients (~3–5 seconds)
+- Manual peer discovery — tap a nearby device to connect
 - Channel codes filter who can talk to whom — only devices on the same code communicate
 - **Mesh relay**: if A connects to C and C connects to B, audio forwards A→C→B automatically
 
 ## Features
 
-- PTT (Push-to-Talk) mode
-- Group Call mode (continuous audio)
+- PTT (Push-to-Talk) mode — hold to talk, release to send
+- Group Call mode — native real-time audio streaming with echo cancellation
+- Manual peer discovery with tap-to-connect UI
 - Channel/room codes for private groups
 - Mesh relay for extended range
 - Fully offline — works with no network infrastructure
@@ -23,42 +23,66 @@ Offline walkie-talkie for Android using WiFi Direct mesh networking. No internet
 ```
 App (React Native / Expo)
 │
-├── src/screens/ChannelScreen.js   — UI, PTT/call logic, channel handshake
-├── App.js                         — Permission requests on launch
+├── src/screens/
+│   ├── HomeScreen.js          — Name, channel code, mode selection
+│   └── ChannelScreen.js       — PTT/call logic, peer list, channel handshake
+├── App.js                     — Permission requests on launch
 │
-└── modules/wifi-direct/           — Native Expo module
-    ├── index.js                   — JS bridge (requireNativeModule)
+└── modules/wifi-direct/       — Native Expo module
+    ├── index.js               — JS bridge (requireNativeModule)
     └── android/
         └── .../wifidirect/
-            ├── WifiDirectManager.kt     — P2P logic, mesh relay, sockets
-            └── WifiDirectExpoModule.kt  — Expo module definition
+            ├── WifiDirectManager.kt      — P2P logic, bidirectional sockets, mesh relay
+            ├── WifiDirectExpoModule.kt   — Expo module bridge
+            └── AudioStreamer.kt          — Native real-time audio (AudioRecord/AudioTrack + AEC)
 ```
+
+## Native Audio Streaming (Group Call)
+
+Group call uses native Android audio APIs for WhatsApp-like quality:
+
+- **AudioRecord** with `VOICE_COMMUNICATION` source — enables platform-level echo cancellation
+- **AudioTrack** in `STREAM_VOICE_CALL` mode — low-latency playback
+- **AcousticEchoCanceler** — prevents hearing your own voice echoed back
+- **NoiseSuppressor** — reduces background noise
+- **20ms PCM frames** (640 bytes at 16kHz mono 16-bit) — near real-time
+- **No file I/O, no base64** — raw PCM bytes sent directly over persistent TCP sockets
 
 ## Connection Flow
 
 1. App opens → requests `RECORD_AUDIO`, `ACCESS_FINE_LOCATION`, `NEARBY_WIFI_DEVICES`
-2. User enters channel code → join
-3. **`createGroup()`** called → device tries to become Group Owner immediately
-4. **`startDiscovery()`** → scans for nearby P2P devices
-5. On discovery:
-   - If we are GO → wait for clients to connect to us
-   - If peer is also GO with lower MAC → we yield, remove group, connect as client
-   - If we are not GO → connect to any discovered peer
-6. On WiFi Direct link established → send `CHAN:` handshake packet
-7. Peer checks channel code → if match, joins the channel peer list
-8. PTT/call audio flows between confirmed channel peers
+2. User enters name + channel code → join
+3. `startDiscovery()` scans for nearby P2P devices
+4. Discovered devices appear in **"Nearby Devices"** list
+5. User taps a device → `connectToPeer()` initiates WiFi Direct connection
+6. Other device accepts invitation (first time only — Android remembers pairing)
+7. Bidirectional persistent TCP socket established between peers
+8. `CHAN:` handshake verifies both peers are on the same channel
+9. PTT or Group Call audio flows between confirmed channel peers
+
+## Network Architecture
+
+```
+┌─────────────┐     Persistent TCP      ┌─────────────┐
+│   Client     │◄──── (bidirectional) ───►│  Group Owner │
+│  AudioRecord │      Port 9876          │  AudioRecord │
+│  AudioTrack  │      TCP_NODELAY        │  AudioTrack  │
+│  AEC + NS    │      64KB buffers       │  AEC + NS    │
+└─────────────┘                          └─────────────┘
+```
+
+- Single socket per peer pair — used for both sending and receiving
+- `TCP_NODELAY` disables Nagle's algorithm for instant sends
+- 64KB buffered I/O streams for throughput
+- Type=1: file-based audio (PTT), Type=3: streaming PCM (group call)
 
 ## Channel Handshake Protocol
 
-After every WiFi Direct connection, devices exchange a small JSON packet:
+After WiFi Direct connection, devices exchange a JSON packet:
 ```
 CHAN:{"channel":"mycode","user":"Alice"}
 ```
-Only devices with matching channel codes become active peers. Others are ignored.
-
-## Audio Mesh Relay
-
-When the Group Owner receives audio from peer B, it forwards to all other connected peers (e.g., peer C). This enables A↔C↔B communication even if A and B can't see each other directly.
+Only devices with matching channel codes become active peers. Reply sent only once per new peer to prevent flooding.
 
 ## Build & Deploy
 
@@ -70,43 +94,36 @@ When the Group Owner receives audio from peer B, it forwards to all other connec
 ### Build APK
 
 ```bash
-# Install JS dependencies
 npm install
 
-# Build (no JS bundle — app fetches from Metro for hot reload)
-cd android
-./gradlew assembleDebug
+# Full build (JS + native)
+npx expo export --platform android
+cp dist/_expo/static/js/android/*.hbc android/app/src/main/assets/index.android.bundle
+cd android && ./gradlew assembleDebug
 
 # Install on device
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### Hot Reload (JS changes only)
+### Native-only rebuild (Kotlin changes)
 
 ```bash
-# Start Metro bundler
-npx expo start
-
-# Forward Metro port to device
-adb reverse tcp:8081 tcp:8081
-
-# Reload app on device
-curl -X POST http://localhost:8081/reload
+cd android && ./gradlew assembleDebug
 ```
 
-> Native (Kotlin) changes always require a full `./gradlew assembleDebug` rebuild.
+### JS-only rebuild
+
+```bash
+npx expo export --platform android
+cp dist/_expo/static/js/android/*.hbc android/app/src/main/assets/index.android.bundle
+cd android && ./gradlew assembleDebug
+```
 
 ### Wireless ADB
 
 ```bash
-# Pair (one-time per device)
 adb pair <IP>:<PAIR_PORT> <CODE>
-
-# Connect
-adb connect <IP>:<MAIN_PORT>
-
-# Forward Metro
-adb -s <IP>:<PORT> reverse tcp:8081 tcp:8081
+adb connect <IP>:<PORT>
 ```
 
 ## Permissions
@@ -119,7 +136,9 @@ adb -s <IP>:<PORT> reverse tcp:8081 tcp:8081
 
 ## Known Behavior
 
-- First connection: **3–8 seconds** (Group Owner already formed, client just joins)
-- Reconnection: **2–4 seconds** (persistent group invitation)
-- `BUSY` from P2P stack means an invitation is being processed — no retry needed, broadcast will confirm result
-- Two devices both becoming GO: higher MAC address yields automatically
+- First connection: **3–8 seconds** (WiFi Direct pairing + invitation)
+- Reconnection: **2–4 seconds** (Android remembers pairing)
+- Discovery auto-retries when P2P stack is busy
+- End call stops both recording and playback immediately
+- Disconnect auto-restarts discovery for reconnection
+- Server socket properly cleaned up on destroy (no port-busy on restart)
